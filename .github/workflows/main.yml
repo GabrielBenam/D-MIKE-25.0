@@ -1,65 +1,123 @@
-name: Compilar Autoarpa Lab
+# Compila D-MIKE para Windows y arma el instalador.
+# Se ejecuta solo al subir cambios a la rama main, o a mano desde la pestaña Actions (botón "Run workflow").
+name: Compilar D-MIKE para Windows
 
 on:
   push:
-    branches: [ main ]
-    tags: [ 'v*' ]
+    branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pages: write
-  id-token: write
-
 jobs:
-  pruebas:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Pruebas del motor de acordes
-        run: node tests/engine.test.js
-
   windows:
-    needs: pruebas
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Instalar dependencias
-        run: npm install --no-audit --no-fund
-      - name: Compilar instalador y portable
-        run: npx electron-builder --win nsis portable --publish never
-      - name: Subir ejecutables
-        uses: actions/upload-artifact@v4
-        with:
-          name: AutoarpaLab-Windows
-          path: dist/*.exe
-      - name: Publicar release (solo con etiqueta v*)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.exe
+      - name: Descargar el código
+        uses: actions/checkout@v5
 
-  web:
-    needs: pruebas
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Preparar sitio
+      - name: Extraer el código del zip (si se subió como un solo archivo)
+        shell: python
         run: |
-          mkdir -p _site
-          cp -r index.html styles.css src _site/
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+          import glob, os, re, shutil, zipfile
+          zips = sorted(glob.glob("d-mike_*.zip"))
+          if not zips:
+              print("No hay un zip d-mike_*.zip en la raíz: se usa el código del repositorio tal como está.")
+          else:
+              z = zips[-1]; print("Usando " + z)
+              with zipfile.ZipFile(z) as f: f.extractall("_zip")
+              src = "_zip/d-mike" if os.path.isdir("_zip/d-mike") else "_zip"
+              # se borra primero lo que trae el zip para que no se mezclen archivos de versiones anteriores
+              for nombre in os.listdir(src):
+                  if nombre in (".github",) or nombre.endswith(".zip"): continue
+                  if os.path.isdir(nombre): shutil.rmtree(nombre)
+                  elif os.path.exists(nombre): os.remove(nombre)
+              n = 0
+              for raiz, _, archivos in os.walk(src):
+                  for a in archivos:
+                      o = os.path.join(raiz, a); d = os.path.join(".", os.path.relpath(o, src))
+                      if d.replace(os.sep, "/").startswith("./.github/"): continue
+                      os.makedirs(os.path.dirname(d) or ".", exist_ok=True); shutil.copy2(o, d); n += 1
+              shutil.rmtree("_zip")
+              v = re.search(r'VERSION = "([^"]+)"', open("app/api.py", encoding="utf-8").read())[1]
+              print("Archivos extraídos: %d · versión del código: %s" % (n, v))
+
+      - name: Revisar que estén todos los archivos
+        shell: python
+        run: |
+          import os, sys
+          if not os.path.exists("MANIFIESTO.txt"):
+              print("No encuentro MANIFIESTO.txt en la raíz del repositorio.")
+              print("Sube el archivo d-mike_v0.21.1.zip (sin extraer) a la raíz del repositorio y vuelve a compilar.")
+              sys.exit(1)
+          # el archivo de compilación se pega aparte en .github/workflows (con cualquier nombre), por eso no se revisa aquí
+          lista = [l.strip() for l in open("MANIFIESTO.txt", encoding="utf-8") if l.strip() and not l.startswith("#") and not l.strip().startswith(".github/")]
+          faltan = [f for f in lista if not os.path.exists(f)]
+          if faltan:
+              print("Faltan %d archivos:" % len(faltan))
+              for f in faltan: print("   - " + f)
+              sys.exit(1)
+          print("Están los %d archivos del manifiesto." % len(lista))
+
+      - name: Instalar Python 3.12
+        uses: actions/setup-python@v6
         with:
-          path: _site
-      - id: deploy
-        uses: actions/deploy-pages@v4
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+          pip install pyinstaller
+
+      - name: Pruebas del motor (sin interfaz)
+        run: python -m pytest pruebas -q -m "not interfaz" --ignore-glob="*capturas*"
+
+      - name: Leer la versión
+        id: version
+        shell: python
+        run: |
+          import os, re
+          v = re.search(r'VERSION = "([^"]+)"', open("app/api.py", encoding="utf-8").read())[1]
+          open(os.environ["GITHUB_OUTPUT"], "a").write(f"v={v}\n")
+
+      - name: Compilar con PyInstaller
+        run: >
+          pyinstaller --noconfirm --clean --windowed --name D-MIKE
+          --icon app/datos/icono.ico
+          --add-data "app/ui;app/ui" --add-data "app/datos;app/datos"
+          --collect-all webview
+          --collect-all pythonnet --collect-all clr_loader
+          --hidden-import matplotlib.backends.backend_svg
+          --hidden-import matplotlib.backends.backend_agg
+          main.py
+
+      - name: Revisar el ejecutable (sin ventana)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\D-MIKE\D-MIKE.exe" -ArgumentList "--prueba" -Wait -PassThru -WorkingDirectory "dist"
+          if ($p.ExitCode -ne 0) { Get-Content dist\prueba_error.txt -ErrorAction SilentlyContinue; exit 1 }
+          Write-Host "Ejecutable revisado: OK"
+
+      - name: Descargar el instalador de WebView2 de Microsoft
+        shell: pwsh
+        run: Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "instalador\MicrosoftEdgeWebview2Setup.exe"
+
+      - name: Armar el instalador (Inno Setup)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            if (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe") { $env:Path += ";C:\Program Files (x86)\Inno Setup 6" }
+            else { choco install innosetup -y --no-progress; $env:Path += ";C:\Program Files (x86)\Inno Setup 6" }
+          }
+          iscc /DVersion=${{ steps.version.outputs.v }} instalador\d-mike.iss
+
+      - name: Publicar el instalador para descargar
+        uses: actions/upload-artifact@v6
+        with:
+          name: D-MIKE-instalador-${{ steps.version.outputs.v }}
+          path: instalador\salida\*.exe
+          retention-days: 30
